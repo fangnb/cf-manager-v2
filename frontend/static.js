@@ -376,6 +376,14 @@ async function rollbackWorkerToHistory(name, idx){
   } else showNotification((r && r.error) || "回滚失败", "error");
 }
 window.rollbackWorkerToHistory = rollbackWorkerToHistory;
+async function rollbackWorkerVersion(name, versionId){
+  if(!confirm("将 Worker " + name + " 回滚到该版本？线上流量将切回此版本。")) return;
+  showNotification("正在回滚...", "warning");
+  var r = await api("rollback-worker-version", { accountId: currentAccountId, scriptName: name, versionId: versionId });
+  if(r && r.success){ showNotification("回滚成功"); closeVersionsModal(); setTimeout(refreshWorkers, 800); }
+  else showNotification((r && r.error) || "回滚失败", "error");
+}
+window.rollbackWorkerVersion = rollbackWorkerVersion;
 async function openVersionsFor(name){
   el("versionsSub").textContent = name;
   el("versionsList").innerHTML = "加载中...";
@@ -399,13 +407,21 @@ async function openVersionsFor(name){
   if(!r || !r.success){ html += "<div class=\"small\">" + esc((r && r.error) || "获取失败") + "</div>"; }
   else {
     var vers = r.result || [];
+    // 获取当前线上版本，用于标记
+    var curVid = "";
+    try {
+      var rc = await api("get-worker-current-version", { accountId: currentAccountId, scriptName: name });
+      if(rc && rc.success && rc.currentVersionId) curVid = rc.currentVersionId;
+    } catch(e){}
     if(!vers.length){ html += "<div class=\"small\">暂无版本记录</div>"; }
     else {
-      html += "<table class=\"table\"><thead><tr><th>版本 ID</th><th>创建时间</th><th>兼容日期</th></tr></thead><tbody>";
+      html += "<table class=\"table\"><thead><tr><th>版本 ID</th><th>创建时间</th><th>兼容日期</th><th>状态</th><th>操作</th></tr></thead><tbody>";
       vers.forEach(function(v){
-        html += "<tr><td style=\"font-family:monospace;font-size:11px\">" + esc(v.id || "") + "</td><td>" + esc(fmtBJ(v.created_on)) + "</td><td>" + esc(v.compatibility_date || v.compatibilityDate || "-") + "</td></tr>";
+        var vid = v.id || "";
+        var isCur = curVid && vid === curVid;
+        html += "<tr><td style=\"font-family:monospace;font-size:11px\">" + esc(vid) + "</td><td>" + esc(fmtBJ(v.created_on)) + "</td><td>" + esc(v.compatibility_date || v.compatibilityDate || "-") + "</td><td>" + (isCur ? "<span class=\"pill green\">当前</span>" : "") + "</td><td>" + (isCur ? "" : "<button class=\"btn small\" onclick=\"rollbackWorkerVersion('" + escA(name) + "', '" + escA(vid) + "')\">回滚</button>") + "</td></tr>";
       });
-      html += "</tbody></table>";
+      html += "</tbody></table><div class=\"small\" style=\"color:#6b7280;margin-top:8px\">回滚将把线上流量切回所选版本（100%），无需重新上传代码</div>";
     }
   }
   el("versionsList").innerHTML = html;
@@ -1214,8 +1230,9 @@ async function refreshR2Buckets(){
     var d = document.createElement("div"); d.className = "kv-item";
     d.innerHTML = "<div style=\"flex:1;min-width:0\"><div style=\"font-weight:600\">" + esc(nm) + "</div><div class=\"small\">" + esc(b.creation_date || "") + (b.storage_class ? " · " + esc(b.storage_class) : "") + (b.location ? " · " + esc(b.location) : "") + "</div></div>" +
       "<div class=\"btns\"><select class=\"input\" data-sc=\"" + escA(nm) + "\" style=\"width:auto;font-size:12px\"><option value=\"Standard\">Standard</option><option value=\"InfrequentAccess\">InfrequentAccess</option></select>" +
-      "<button class=\"btn small\" data-a=\"sc\">改存储类型</button><button class=\"btn small danger\" data-a=\"del\">删除</button></div>";
+      "<button class=\"btn small primary\" data-a=\"mgr\">管理</button><button class=\"btn small\" data-a=\"sc\">改存储类型</button><button class=\"btn small danger\" data-a=\"del\">删除</button></div>";
     var sel = d.querySelector("select"); if(b.storage_class) sel.value = b.storage_class;
+    d.querySelector("[data-a=\"mgr\"]").addEventListener("click", function(){ openR2BucketDetail(nm); });
     d.querySelector("[data-a=\"sc\"]").addEventListener("click", function(){ updateR2StorageClass(nm, sel.value); });
     d.querySelector("[data-a=\"del\"]").addEventListener("click", function(){ deleteR2Bucket(nm); });
     el("r2BucketsList").appendChild(d);
@@ -1244,6 +1261,378 @@ async function deleteR2Bucket(name){
 }
 window.refreshR2Buckets = refreshR2Buckets; window.openCreateR2Bucket = openCreateR2Bucket;
 window.closeCreateR2Modal = closeCreateR2Modal; window.confirmCreateR2Bucket = confirmCreateR2Bucket;
+// ===== R2 存储桶详情（对标 Cloudflare 官方控制台：对象 / 指标 / 设置） =====
+var r2Detail = { name: "", tab: "objects", prefix: "", info: null, token: "", s3ok: null, tempCreds: null, credsTried: false };
+function r2S3StoreKey(){ return "cfm_r2s3_" + (localStorage.getItem("cfm_accountId") || "default"); }
+function getR2S3Creds(){ try { return JSON.parse(localStorage.getItem(r2S3StoreKey()) || "null"); } catch(e){ return null; } }
+// 解析可用 S3 凭证：优先手动保存的，其次自动申请临时凭证（有效期 1 小时，内存存放）
+async function ensureR2S3Creds(){
+  var manual = getR2S3Creds();
+  if(manual && manual.accessKeyId) return manual;
+  if(r2Detail.tempCreds && r2Detail.tempCreds.expireAt > Date.now()) return r2Detail.tempCreds;
+  var aid = await ensureAccountId();
+  var r = await api("r2-temp-credentials", { accountId: aid, name: r2Detail.name, permission: "object-read-write", ttlSeconds: 3600 });
+  if(r && r.success && r.result && r.result.accessKeyId){
+    r2Detail.tempCreds = { accessKeyId: r.result.accessKeyId, secretAccessKey: r.result.secretAccessKey, sessionToken: r.result.sessionToken, expireAt: Date.now() + 3300 * 1000 };
+    return r2Detail.tempCreds;
+  }
+  return null;
+}
+function r2S3Payload(extra){
+  var c = r2Detail._creds || getR2S3Creds() || {};
+  var s3 = { accessKeyId: c.accessKeyId || "", secretAccessKey: c.secretAccessKey || "" };
+  if(c.sessionToken) s3.sessionToken = c.sessionToken;
+  var p = { s3: s3 };
+  if(extra) for(var k in extra) p[k] = extra[k];
+  return p;
+}
+function fmtR2Size(n){ n = Number(n) || 0; if(n < 1024) return n + " B"; if(n < 1048576) return (n/1024).toFixed(1) + " KB"; if(n < 1073741824) return (n/1048576).toFixed(2) + " MB"; return (n/1073741824).toFixed(2) + " GB"; }
+async function openR2BucketDetail(name){
+  r2Detail.name = name; r2Detail.tab = "objects"; r2Detail.prefix = ""; r2Detail.info = null; r2Detail.token = ""; r2Detail.s3ok = null; r2Detail._creds = null;
+  el("r2DetailName").textContent = name;
+  el("r2ListCard").style.display = "none";
+  el("r2DetailCard").style.display = "block";
+  switchR2Tab("objects");
+}
+function closeR2Detail(){
+  el("r2DetailCard").style.display = "none";
+  el("r2ListCard").style.display = "block";
+  r2Detail.name = "";
+}
+function switchR2Tab(tab){
+  r2Detail.tab = tab;
+  var tabs = document.querySelectorAll(".r2-tab");
+  for(var i = 0; i < tabs.length; i++) tabs[i].className = "r2-tab" + (tabs[i].getAttribute("data-tab") === tab ? " active" : "");
+  el("r2TabObjects").style.display = tab === "objects" ? "block" : "none";
+  el("r2TabMetrics").style.display = tab === "metrics" ? "block" : "none";
+  el("r2TabSettings").style.display = tab === "settings" ? "block" : "none";
+  if(tab === "objects") renderR2ObjectsTab();
+  else if(tab === "metrics") renderR2MetricsTab();
+  else renderR2SettingsTab();
+}
+// ---------- 对象 tab ----------
+async function renderR2ObjectsTab(){
+  var box = el("r2TabObjects");
+  box.innerHTML = "<div class=\"small\" style=\"text-align:center;padding:20px\">正在准备 S3 访问凭证...</div>";
+  var creds = await ensureR2S3Creds();
+  if(!creds){
+    box.innerHTML = "<div style=\"max-width:560px;margin:20px auto;text-align:center\">" +
+      "<h4 style=\"margin:0 0 8px\">配置 R2 S3 API 凭证</h4>" +
+      "<div class=\"small\" style=\"margin-bottom:16px\">自动获取临时凭证失败（Token 可能缺少 R2 权限），请手动输入 R2 API 令牌。<br>获取位置：Cloudflare 控制台 → R2 对象存储 → 管理 R2 API 令牌。<br>凭证仅保存在本浏览器本地，随请求发送用于签名，不会上传存储。</div>" +
+      "<div class=\"label\" style=\"text-align:left\">Access Key ID</div><input id=\"r2S3KeyId\" class=\"input\" placeholder=\"Access Key ID\" autocomplete=\"off\">" +
+      "<div class=\"label\" style=\"text-align:left;margin-top:10px\">Secret Access Key</div><input id=\"r2S3Secret\" class=\"input\" type=\"password\" placeholder=\"Secret Access Key\" autocomplete=\"off\">" +
+      "<div style=\"display:flex;gap:8px;justify-content:center;margin-top:14px\"><button class=\"btn primary\" onclick=\"saveR2S3Creds()\">保存并验证</button></div>" +
+      "<div id=\"r2S3TestMsg\" class=\"small\" style=\"margin-top:10px\"></div></div>";
+    return;
+  }
+  r2Detail._creds = creds;
+  box.innerHTML =
+    "<div id=\"r2ObjStats\" style=\"display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:16px\"></div>" +
+    "<div style=\"display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin-bottom:12px\">" +
+      "<div class=\"small\" id=\"r2PathNav\" style=\"font-size:13px\"></div>" +
+      "<div style=\"display:flex;gap:8px\">" +
+        "<input type=\"file\" id=\"r2FileInput\" multiple style=\"display:none\">" +
+        "<button class=\"btn\" onclick=\"r2CreateFolder()\">添加文件夹</button>" +
+        "<button class=\"btn primary\" onclick=\"document.getElementById('r2FileInput').click()\">上传文件</button>" +
+        "<button class=\"btn\" onclick=\"loadR2Objects()\" title=\"刷新\">↻</button>" +
+      "</div></div>" +
+    "<div id=\"r2DropZone\"><div id=\"r2ObjList\">加载中...</div>" +
+    "<div class=\"small\" style=\"margin-top:10px;color:#94a3b8\">超过 300 MB 的文件请使用 S3 兼容 API 或 rclone 等工具直接上传。</div></div>";
+  var fi = el("r2FileInput");
+  fi.addEventListener("change", function(){ r2UploadFiles(fi.files); fi.value = ""; });
+  var dz = el("r2DropZone");
+  dz.addEventListener("dragover", function(e){ e.preventDefault(); dz.style.outline = "2px dashed #2563eb"; dz.style.outlineOffset = "-2px"; });
+  dz.addEventListener("dragleave", function(){ dz.style.outline = ""; });
+  dz.addEventListener("drop", function(e){ e.preventDefault(); dz.style.outline = ""; if(e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files.length) r2UploadFiles(e.dataTransfer.files); });
+  loadR2BucketInfo();
+  loadR2Objects();
+}
+async function saveR2S3Creds(){
+  var id = el("r2S3KeyId").value.trim(), sec = el("r2S3Secret").value.trim();
+  if(!id || !sec){ el("r2S3TestMsg").textContent = "请填写完整凭证"; return; }
+  localStorage.setItem(r2S3StoreKey(), JSON.stringify({ accessKeyId: id, secretAccessKey: sec }));
+  el("r2S3TestMsg").textContent = "正在验证...";
+  var aid = await ensureAccountId();
+  var r = await api("r2-s3-test", { accountId: aid, name: r2Detail.name, s3: { accessKeyId: id, secretAccessKey: sec } });
+  if(r && r.success){ showNotification("S3 凭证验证通过"); renderR2ObjectsTab(); }
+  else { el("r2S3TestMsg").textContent = "验证失败：" + ((r && r.error) || ""); }
+}
+function r2ClearS3Creds(){ localStorage.removeItem(r2S3StoreKey()); r2Detail.tempCreds = null; r2Detail._creds = null; renderR2ObjectsTab(); }
+async function loadR2BucketInfo(){
+  var aid = await ensureAccountId();
+  var jur = el("r2Jurisdiction") ? el("r2Jurisdiction").value : "default";
+  var r = await api("get-r2-bucket", { accountId: aid, name: r2Detail.name, jurisdiction: jur });
+  if(r && r.success) r2Detail.info = r.result;
+  renderR2ObjStats();
+}
+function renderR2ObjStats(){
+  var box = el("r2ObjStats"); if(!box) return;
+  var b = r2Detail.info || {};
+  var locName = { wnam: "北美西部", enam: "北美东部", weur: "西欧", eeur: "东欧", apac: "亚太地区", oc: "大洋洲" };
+  var stats = [
+    { k: "默认存储类", v: esc(b.storage_class || "标准") },
+    { k: "位置", v: esc(locName[b.location] || b.location || "-") },
+    { k: "创建时间", v: esc(b.creation_date ? String(b.creation_date).slice(0, 10) : "-") },
+    { k: "A 类操作（读）", v: "-" },
+    { k: "B 类操作（写）", v: "-" }
+  ];
+  box.innerHTML = stats.map(function(s){
+    return "<div class=\"r2-stat\"><div class=\"k\">" + s.k + "</div><div class=\"v\">" + s.v + "</div></div>";
+  }).join("");
+}
+function r2PathCrumbs(){
+  var nav = el("r2PathNav"); if(!nav) return;
+  var parts = r2Detail.prefix ? r2Detail.prefix.replace(/\/$/, "").split("/") : [];
+  var h = "<a href=\"javascript:void(0)\" onclick=\"r2NavPrefix('')\" style=\"color:#2563eb;text-decoration:none\">" + esc(r2Detail.name) + "</a>";
+  var acc = "";
+  parts.forEach(function(p, i){
+    acc += p + "/";
+    h += " / <a href=\"javascript:void(0)\" onclick=\"r2NavPrefix('" + escA(acc) + "')\" style=\"color:#2563eb;text-decoration:none\">" + esc(p) + "</a>";
+  });
+  nav.innerHTML = h;
+}
+function r2NavPrefix(prefix){ r2Detail.prefix = prefix || ""; r2Detail.token = ""; loadR2Objects(); }
+async function loadR2Objects(){
+  var box = el("r2ObjList"); if(!box) return;
+  box.innerHTML = "加载中...";
+  r2PathCrumbs();
+  var aid = await ensureAccountId();
+  var p = r2S3Payload({ accountId: aid, name: r2Detail.name, prefix: r2Detail.prefix, maxKeys: 100 });
+  if(r2Detail.token) p.continuationToken = r2Detail.token;
+  var r = await api("r2-objects-list", p);
+  if(!r || !r.success){ box.innerHTML = "<div style=\"text-align:center;padding:20px;color:#ef4444\">加载失败：" + esc((r && r.error) || "") + "<div style=\"margin-top:8px\"><button class=\"btn small\" onclick=\"r2ClearS3Creds()\">重新配置 S3 凭证</button></div></div>"; return; }
+  var d = r.result || {};
+  r2Detail.token = d.isTruncated ? d.nextToken : "";
+  var rows = "";
+  (d.folders || []).forEach(function(f){
+    var short = f.replace(r2Detail.prefix, "").replace(/\/$/, "");
+    rows += "<tr class=\"r2-objrow\"><td><a href=\"javascript:void(0)\" onclick=\"r2NavPrefix('" + escA(f) + "')\" style=\"color:#2563eb;text-decoration:none\">📁 " + esc(short) + "</a></td><td>文件夹</td><td>-</td><td>-</td><td>-</td><td></td></tr>";
+  });
+  (d.files || []).forEach(function(f){
+    if(f.key === r2Detail.prefix) return;
+    var short = f.key.replace(r2Detail.prefix, "");
+    if(!short) return;
+    var lm = f.lastModified ? fmtBJ(f.lastModified) : "-";
+    rows += "<tr class=\"r2-objrow\"><td style=\"word-break:break-all\">" + esc(short) + "</td><td>文件</td><td>" + esc(f.storageClass || "Standard") + "</td><td>" + fmtR2Size(f.size) + "</td><td>" + esc(lm) + "</td>" +
+      "<td style=\"white-space:nowrap\"><button class=\"btn small\" onclick=\"r2DownloadObject('" + escA(f.key) + "')\">下载</button> <button class=\"btn small danger\" onclick=\"r2DeleteObject('" + escA(f.key) + "')\">删除</button></td></tr>";
+  });
+  var more = d.isTruncated ? "<div style=\"text-align:center;margin-top:10px\"><button class=\"btn small\" onclick=\"loadR2ObjectsMore()\">加载更多</button></div>" : "";
+  if(!rows){
+    box.innerHTML = "<div style=\"border:1px dashed #e2e8f0;border-radius:8px;padding:48px 20px;text-align:center;color:#64748b\">" +
+      "<div style=\"font-size:44px;margin-bottom:12px\">☁️⬆️</div>" +
+      "<div style=\"font-weight:600;color:#0f1724;margin-bottom:6px\">您的存储桶已准备就绪。添加文件即可开始使用。</div>" +
+      "<div style=\"margin-bottom:6px\"><a href=\"javascript:void(0)\" onclick=\"document.getElementById('r2FileInput').click()\" style=\"color:#2563eb;text-decoration:none\">拖放或从计算机中选择 &gt;</a></div>" +
+      "<div class=\"small\">超过 300 MB 的文件只能使用 S3 兼容性 API 或 Workers 上载。</div></div>" + more;
+  } else {
+    box.innerHTML = "<table class=\"table\" style=\"margin-top:0\"><thead><tr><th>对象</th><th>类型</th><th>存储类</th><th>大小</th><th>已修改</th><th>操作</th></tr></thead><tbody>" + rows + "</tbody></table>" + more;
+  }
+}
+function loadR2ObjectsMore(){ loadR2ObjectsKeep(); }
+async function loadR2ObjectsKeep(){
+  // 分页追加：保持已有行，追加下一页
+  var aid = await ensureAccountId();
+  var p = r2S3Payload({ accountId: aid, name: r2Detail.name, prefix: r2Detail.prefix, maxKeys: 100, continuationToken: r2Detail.token });
+  var r = await api("r2-objects-list", p);
+  if(!r || !r.success){ showNotification((r && r.error) || "加载失败", "error"); return; }
+  r2Detail.token = "";
+  loadR2Objects();
+}
+function readFileAsBase64R2(f){
+  return new Promise(function(res, rej){
+    var r = new FileReader();
+    r.onload = function(){ var s = String(r.result || ""); var i = s.indexOf(","); res(i >= 0 ? s.slice(i + 1) : s); };
+    r.onerror = function(){ rej(new Error("读取失败")); };
+    r.readAsDataURL(f);
+  });
+}
+async function r2UploadFiles(fileList){
+  var files = Array.from(fileList || []);
+  if(!files.length) return;
+  var over = files.filter(function(f){ return f.size > 50 * 1048576; });
+  if(over.length) return showNotification("单个文件超过 50MB（" + over[0].name + "），请用 S3 工具直传", "error");
+  var aid = await ensureAccountId();
+  var ok = 0, fail = 0;
+  showNotification("开始上传 " + files.length + " 个文件...");
+  for(var i = 0; i < files.length; i++){
+    var f = files[i];
+    try {
+      var b64 = await readFileAsBase64R2(f);
+      var key = r2Detail.prefix + f.name;
+      var r = await api("r2-object-put", r2S3Payload({ accountId: aid, name: r2Detail.name, key: key, content: b64, contentType: f.type || "application/octet-stream" }));
+      if(r && r.success) ok++; else { fail++; showNotification("上传失败 " + f.name + "：" + ((r && r.error) || ""), "error"); }
+    } catch(e){ fail++; showNotification("上传失败 " + f.name + "：" + e.message, "error"); }
+  }
+  showNotification("上传完成：成功 " + ok + "，失败 " + fail);
+  loadR2Objects();
+}
+async function r2DeleteObject(key){
+  var short = key.replace(r2Detail.prefix, "");
+  if(!confirm("删除对象 " + short + "？")) return;
+  var aid = await ensureAccountId();
+  var r = await api("r2-object-delete", r2S3Payload({ accountId: aid, name: r2Detail.name, key: key }));
+  if(r && r.success){ showNotification("已删除"); loadR2Objects(); }
+  else showNotification((r && r.error) || "删除失败", "error");
+}
+async function r2DownloadObject(key){
+  var aid = await ensureAccountId();
+  var r = await api("r2-object-download-url", r2S3Payload({ accountId: aid, name: r2Detail.name, key: key, expires: 3600 }));
+  if(r && r.success && r.result && r.result.url){ window.open(r.result.url, "_blank"); }
+  else showNotification((r && r.error) || "生成下载链接失败", "error");
+}
+async function r2CreateFolder(){
+  var name = prompt("文件夹名称：");
+  if(!name) return;
+  name = name.trim().replace(/^\/+|\/+$/g, "");
+  if(!name) return;
+  var aid = await ensureAccountId();
+  var key = r2Detail.prefix + name + "/";
+  var r = await api("r2-object-put", r2S3Payload({ accountId: aid, name: r2Detail.name, key: key, content: "", contentType: "application/x-directory" }));
+  if(r && r.success){ showNotification("文件夹已创建"); loadR2Objects(); }
+  else showNotification((r && r.error) || "创建失败", "error");
+}
+window.openR2BucketDetail = openR2BucketDetail; window.closeR2Detail = closeR2Detail; window.switchR2Tab = switchR2Tab;
+window.saveR2S3Creds = saveR2S3Creds; window.r2ClearS3Creds = r2ClearS3Creds; window.r2NavPrefix = r2NavPrefix;
+window.loadR2Objects = loadR2Objects; window.loadR2ObjectsMore = loadR2ObjectsMore; window.r2UploadFiles = r2UploadFiles;
+window.r2DeleteObject = r2DeleteObject; window.r2DownloadObject = r2DownloadObject; window.r2CreateFolder = r2CreateFolder;
+// ---------- 指标 tab ----------
+function renderR2MetricsTab(){
+  var box = el("r2TabMetrics");
+  box.innerHTML = "<div style=\"display:flex;justify-content:flex-end;margin-bottom:12px\"><select id=\"r2MetricsRange\" class=\"input\" style=\"width:auto\" onchange=\"renderR2MetricsTab()\"><option value=\"24h\">过去 24 小时</option><option value=\"7d\">过去 7 天</option><option value=\"30d\">过去 30 天</option></select></div>" +
+    "<div id=\"r2MetricsCards\" style=\"display:grid;grid-template-columns:repeat(6,1fr);gap:12px\"><div class=\"small\">指标加载中...</div></div>";
+  loadR2Metrics();
+}
+async function loadR2Metrics(){
+  var box = el("r2MetricsCards"); if(!box) return;
+  var range = el("r2MetricsRange") ? el("r2MetricsRange").value : "24h";
+  var aid = await ensureAccountId();
+  var r = await api("r2-metrics", { accountId: aid, name: r2Detail.name, range: range });
+  var cards = [
+    { k: "平均存储", v: "-" }, { k: "已检索数据", v: "-" }, { k: "A 类操作", v: "-" }, { k: "B 类操作", v: "-" }, { k: "免费操作", v: "-" }, { k: "请求总数", v: "-" }
+  ];
+  if(r && r.success && r.result){
+    var m = r.result;
+    cards[0].v = m.avgStorage || "-"; cards[1].v = m.egress || "-"; cards[2].v = m.classA || "-"; cards[3].v = m.classB || "-"; cards[4].v = m.freeOps || "-"; cards[5].v = m.requests || "-";
+  } else {
+    box.innerHTML = "<div class=\"small\" style=\"grid-column:1/-1;text-align:center;padding:20px\">指标暂不可用：" + esc((r && r.error) || "未知错误") + "</div>";
+    return;
+  }
+  box.innerHTML = "<div class=\"small\" style=\"grid-column:1/-1;color:#94a3b8\">统计口径：A 类=写入/列出类操作；B 类=读取类操作；免费=删除对象/取消分片上传（不计费）。GraphQL 数据约有 1-2 小时延迟。</div>" +
+  cards.map(function(c){
+    return "<div class=\"card\" style=\"padding:16px\"><div class=\"r2-stat\"><div class=\"k\">" + c.k + "</div><div class=\"v\" style=\"font-size:20px\">" + esc(c.v) + "</div></div></div>";
+  }).join("");
+}
+// ---------- 设置 tab ----------
+function renderR2SettingsTab(){
+  var box = el("r2TabSettings");
+  box.innerHTML = "<div id=\"r2SettingsBody\">加载中...</div>";
+  loadR2Settings();
+}
+async function loadR2Settings(){
+  var box = el("r2SettingsBody"); if(!box) return;
+  var aid = await ensureAccountId();
+  var jur = el("r2Jurisdiction") ? el("r2Jurisdiction").value : "default";
+  var r = await api("get-r2-bucket", { accountId: aid, name: r2Detail.name, jurisdiction: jur });
+  var b = (r && r.success && r.result) || {};
+  var locName = { wnam: "北美西部", enam: "北美东部", weur: "西欧", eeur: "东欧", apac: "亚太地区", oc: "大洋洲" };
+  var s3ep = "https://" + aid + ".r2.cloudflarestorage.com/" + r2Detail.name;
+  var h = "<h4 style=\"margin:0 0 12px\">常规问题</h4>" +
+    "<div class=\"card\" style=\"padding:16px;margin-bottom:20px\"><div style=\"display:grid;grid-template-columns:repeat(3,1fr);gap:12px\">" +
+    "<div class=\"r2-stat\"><div class=\"k\">名称：</div><div class=\"v\">" + esc(b.name || r2Detail.name) + "</div></div>" +
+    "<div class=\"r2-stat\"><div class=\"k\">位置：</div><div class=\"v\">" + esc(locName[b.location] || b.location || "-") + "</div></div>" +
+    "<div class=\"r2-stat\"><div class=\"k\">创建时间：</div><div class=\"v\">" + esc(b.creation_date ? fmtBJ(b.creation_date) : "-") + "</div></div>" +
+    "</div><div class=\"r2-stat\" style=\"margin-top:12px\"><div class=\"k\">S3 API：</div><div class=\"v\" style=\"font-weight:400;font-size:13px\">" + esc(s3ep) +
+    " <button class=\"btn small\" onclick=\"copyToClipboard('" + escA(s3ep) + "')\">复制</button></div></div></div>";
+  h += "<h4 style=\"margin:0 0 12px\">自定义域 <span title=\"将您自己的域名绑定到此存储桶\" style=\"cursor:help;color:#94a3b8\">ⓘ</span></h4><div id=\"r2CustomDomains\"><div class=\"small\">加载中...</div></div>";
+  h += "<h4 style=\"margin:20px 0 12px\">公共开发 URL <span title=\"r2.dev 域名，用于开发测试\" style=\"cursor:help;color:#94a3b8\">ⓘ</span></h4><div id=\"r2PublicUrl\"><div class=\"small\">加载中...</div></div>";
+  h += "<h4 style=\"margin:20px 0 12px\">R2 数据目录 <span title=\"Apache Iceberg 兼容的数据目录，可用 Spark / PyIceberg 等查询引擎连接\" style=\"cursor:help;color:#94a3b8\">ⓘ</span></h4><div id=\"r2DataCatalog\"><div class=\"small\">加载中...</div></div>";
+  box.innerHTML = h;
+  loadR2Domains();
+  loadR2DataCatalog();
+}
+async function loadR2Domains(){
+  var aid = await ensureAccountId();
+  var r = await api("r2-bucket-domains", { accountId: aid, name: r2Detail.name });
+  var cd = el("r2CustomDomains"), pu = el("r2PublicUrl");
+  if(!r || !r.success){
+    if(cd) cd.innerHTML = "<div class=\"small\">加载失败：" + esc((r && r.error) || "") + "</div>";
+    if(pu) pu.innerHTML = "<div class=\"small\">加载失败：" + esc((r && r.error) || "") + "</div>";
+    return;
+  }
+  var d = r.result || {};
+  var customs = d.custom || [];
+  if(cd){
+    cd.innerHTML = "<div class=\"card\" style=\"padding:16px\">" +
+      (customs.length ? customs.map(function(x){
+        return "<div class=\"kv-item\"><span>" + esc(x.domain || x) + "</span><button class=\"btn small danger\" onclick=\"r2RemoveCustomDomain('" + escA(x.domain || x) + "')\">删除</button></div>";
+      }).join("") : "<div class=\"small\" style=\"text-align:center;padding:8px\">没有为此存储桶分配自定义域。</div>") +
+      "<div style=\"margin-top:10px;display:flex;gap:8px\"><input id=\"r2NewDomain\" class=\"input\" placeholder=\"例如 cdn.example.com\" style=\"max-width:320px\"><button class=\"btn\" onclick=\"r2AddCustomDomain()\">添加</button></div></div>";
+  }
+  if(pu){
+    var pub = d.publicUrl || "";
+    pu.innerHTML = "<div class=\"card\" style=\"padding:16px\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px\">" +
+      "<span class=\"small\">" + (pub ? "已启用：<b>" + esc(pub) + "</b>" : "已对此存储桶禁用公用开发 URL。") + "</span>" +
+      (pub ? "<button class=\"btn small danger\" onclick=\"r2TogglePublicUrl(false)\">禁用</button>" : "<button class=\"btn primary small\" onclick=\"r2TogglePublicUrl(true)\">启用</button>") +
+      "</div></div>";
+  }
+}
+async function r2AddCustomDomain(){
+  var domain = el("r2NewDomain").value.trim();
+  if(!domain) return showNotification("请输入域名", "error");
+  var aid = await ensureAccountId();
+  var r = await api("r2-custom-domain-add", { accountId: aid, name: r2Detail.name, domain: domain });
+  if(r && r.success){ showNotification("自定义域已添加"); loadR2Domains(); }
+  else showNotification((r && r.error) || "添加失败", "error");
+}
+async function r2RemoveCustomDomain(domain){
+  if(!confirm("删除自定义域 " + domain + "？")) return;
+  var aid = await ensureAccountId();
+  var r = await api("r2-custom-domain-remove", { accountId: aid, name: r2Detail.name, domain: domain });
+  if(r && r.success){ showNotification("已删除"); loadR2Domains(); }
+  else showNotification((r && r.error) || "删除失败", "error");
+}
+async function r2TogglePublicUrl(enable){
+  var aid = await ensureAccountId();
+  var r = await api("r2-public-url-toggle", { accountId: aid, name: r2Detail.name, enable: enable });
+  if(r && r.success){ showNotification(enable ? "公共开发 URL 已启用" : "已禁用"); loadR2Domains(); }
+  else showNotification((r && r.error) || "操作失败", "error");
+}
+async function loadR2DataCatalog(){
+  var box = el("r2DataCatalog"); if(!box) return;
+  var aid = await ensureAccountId();
+  var r = await api("r2-catalog-get", { accountId: aid, name: r2Detail.name });
+  if(!r || !r.success){
+    box.innerHTML = "<div class=\"card\" style=\"padding:16px\"><div class=\"small\">加载失败：" + esc((r && r.error) || "") + "</div></div>";
+    return;
+  }
+  var c = r.result || {};
+  if(!c.enabled){
+    box.innerHTML = "<div class=\"card\" style=\"padding:16px\"><div style=\"display:flex;justify-content:space-between;align-items:center;gap:10px\">" +
+      "<span class=\"small\">已对此存储桶禁用数据目录。</span>" +
+      "<button class=\"btn primary small\" onclick=\"r2ToggleDataCatalog(true)\">启用</button></div></div>";
+    return;
+  }
+  var maint = c.maintenance || {};
+  var comp = maint.compaction || {}, snap = maint.snapshot_expiration || {};
+  var maintTxt = "压缩：" + (comp.state === "enabled" ? "已启用" : "未启用") + " · 快照过期：" + (snap.state === "enabled" ? "已启用" : "未启用");
+  box.innerHTML = "<div class=\"card\" style=\"padding:16px\">" +
+    "<div class=\"r2-stat\" style=\"margin-bottom:10px\"><div class=\"k\">目录 URI：</div><div class=\"v\" style=\"font-weight:400;font-size:13px;word-break:break-all\">" + esc(c.catalogUri || "") +
+    " <button class=\"btn small\" onclick=\"copyToClipboard('" + escA(c.catalogUri || "") + "')\">复制</button></div></div>" +
+    "<div class=\"r2-stat\" style=\"margin-bottom:10px\"><div class=\"k\">仓库名称：</div><div class=\"v\" style=\"font-weight:400;font-size:13px;word-break:break-all\">" + esc(c.warehouse || "") +
+    " <button class=\"btn small\" onclick=\"copyToClipboard('" + escA(c.warehouse || "") + "')\">复制</button></div></div>" +
+    "<div class=\"small\" style=\"margin-bottom:12px\">" + esc(maintTxt) + " · 与 Iceberg 兼容的查询引擎（例如 Spark、PyIceberg）使用上述信息连接到此存储桶的数据目录。</div>" +
+    "<button class=\"btn small danger\" onclick=\"r2ToggleDataCatalog(false)\">禁用</button></div>";
+}
+async function r2ToggleDataCatalog(enable){
+  if(!enable && !confirm("禁用数据目录后，Iceberg 表引用将暂时不可访问，确定禁用？")) return;
+  var aid = await ensureAccountId();
+  var r = await api(enable ? "r2-catalog-enable" : "r2-catalog-disable", { accountId: aid, name: r2Detail.name });
+  if(r && r.success){ showNotification(enable ? "数据目录已启用" : "数据目录已禁用"); loadR2DataCatalog(); }
+  else showNotification((r && r.error) || "操作失败", "error");
+}
+window.renderR2MetricsTab = renderR2MetricsTab; window.loadR2Metrics = loadR2Metrics;
+window.renderR2SettingsTab = renderR2SettingsTab; window.r2AddCustomDomain = r2AddCustomDomain;
+window.r2RemoveCustomDomain = r2RemoveCustomDomain; window.r2TogglePublicUrl = r2TogglePublicUrl;
+window.loadR2DataCatalog = loadR2DataCatalog; window.r2ToggleDataCatalog = r2ToggleDataCatalog;
 var currentZoneId = null, currentZoneName = "", currentEditingRecord = null;
 function showZonesList(){ el("zonesList").style.display = "block"; el("dnsRecordsSection").style.display = "none"; currentZoneId = null; refreshZones(); }
 window.backToZones = showZonesList;
