@@ -160,7 +160,7 @@ OAuth 说明：标准 Authorization Code + PKCE（S256）流程；access token �
 
 自建 OAuth 客户端（用于"使用 Cloudflare 账号登录"）：
 
-👉 **[OAuth 客户端配置图文教程](https://fangnb.github.io/cf-panel/oauth-setup-tutorial.html)**（从零创建 → 域名验证 → 设为公开 → 接入面板）
+👉 **[OAuth 客户端配置图文教程](https://fangnb.github.io/cf-manager-v2/oauth-setup-tutorial.html)**（从零创建 → 域名验证 → 设为公开 → 接入面板）
 
 ## 已知限制
 
