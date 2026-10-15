@@ -3,7 +3,7 @@
 单文件 Cloudflare Module Worker，前端只调用同源 `/api`，
 所有 Cloudflare API 请求都由 Worker 后端代理转发，浏览器不再直连 `api.cloudflare.com`（无 CORS 问题）。
 
-> 当前版本：v2.5（`worker.js`）。原版 `_worker.js` 保留，`frontend/` 为未打包的前端源码。
+> 当前版本：v2.5（`worker.js` 单文件，前后端都打包在里面）。
 
 ## 功能
 
@@ -111,10 +111,10 @@ wrangler kv namespace create CF_ACCOUNTS_KV
 
 - 进到 Worker 页面 → 右上角「编辑代码」
 - 把编辑器里的示例代码全删掉
-- 用记事本打开本地的 `_worker.js`，全选复制，粘贴进去（文件约 285KB，粘贴时页面可能卡几秒，耐心等）
+- 用记事本打开本地的 `worker.js`，全选复制，粘贴进去（文件约 455KB，粘贴时页面可能卡几秒，耐心等）
 - 点「保存并部署」
 
-注意：`_worker.js` 已经是打包好的完整文件（前端都嵌在里面了），只贴这一个文件就行，不用管 `frontend/` 目录。
+注意：`worker.js` 已经是打包好的完整单文件（前端都嵌在里面了），只贴这一个文件就行。
 
 **3. 设置访问密码**
 
@@ -135,8 +135,7 @@ wrangler kv namespace create CF_ACCOUNTS_KV
 
 ### 日常更新
 
-- 前端代码改 `frontend/static.js`，改完先跑 `python3 build.py` 再 `wrangler deploy`
-- 只改界面文字、样式的话，直接改 `_worker.js` 里对应的 HTML/CSS 也行，别动 `// ---------------- 前端 JS ----------------` 这行标记
+- 直接改 `worker.js`（单文件）：前端 HTML/CSS/JS 都嵌在里面，改完重新粘贴部署即可
 - 想换 Worker 名字就改 `wrangler.toml` 第一行的 `name`
 
 部署完成后访问 `https://<worker名>.<子域>.workers.dev`，
