@@ -3,10 +3,6 @@
 单文件 Cloudflare Module Worker（`_worker.js`），前端只调用同源 `/api`，
 所有 Cloudflare API 请求都由 Worker 后端代理转发，浏览器不再直连 `api.cloudflare.com`（无 CORS 问题）。
 
-## 相关仓库
-
-- **[cf-panel](https://github.com/fangnb/cf-panel)**：基于本项目的增强分支（v2.5），新增：设置页移除 OAuth 配置卡片、Workers 路由并行加载优化、OAuth Client ID 环境变量预置、修复重部署清空 secrets 等。含 [OAuth 客户端配置图文教程](https://fangnb.github.io/cf-panel/oauth-setup-tutorial.html)。
-
 ## 功能
 
 - **Workers**：列表、部署/编辑/删除、workers.dev 开关、环境变量、Secrets 批量更新、
