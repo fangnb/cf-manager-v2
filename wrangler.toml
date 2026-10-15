@@ -1,6 +1,6 @@
-# Cloudflare 第三方管理面板 v2 — Module Worker 配置
+# Cloudflare 第三方管理面板 — Module Worker 配置（v2.5 单文件）
 name = "cf-manager-v2"
-main = "_worker.js"
+main = "worker.js"
 compatibility_date = "2026-09-01"
 compatibility_flags = ["nodejs_compat"]
 
