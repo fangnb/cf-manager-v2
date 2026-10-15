@@ -1,7 +1,9 @@
 # Cloudflare 第三方管理面板 v2
 
-单文件 Cloudflare Module Worker（`_worker.js`），前端只调用同源 `/api`，
+单文件 Cloudflare Module Worker，前端只调用同源 `/api`，
 所有 Cloudflare API 请求都由 Worker 后端代理转发，浏览器不再直连 `api.cloudflare.com`（无 CORS 问题）。
+
+> 当前版本：v2.5（`worker.js`）。原版 `_worker.js` 保留，`frontend/` 为未打包的前端源码。
 
 ## 功能
 
@@ -18,6 +20,21 @@
 - **设置**：workers.dev 子域名、鉴权方式查看、反馈入口
 - **OAuth 登录**：点"使用 Cloudflare 账号登录"，走官方 OAuth 2.0 + PKCE 授权，
   不用创建/粘贴 API Token；token 快过期自动刷新；多账号切换互不干扰
+
+## 新功能说明（v2.1 → v2.5）
+
+- **v2.5**
+  - 设置页删除整个 OAuth 登录配置卡片，界面更干净
+  - Workers 列表路由加载改为并行（原逐 zone 串行，zone 多时明显变快）
+- **v2.4**
+  - OAuth Client ID 改由部署环境变量 `OAUTH_CLIENT_ID` 统一预置，设置页不再手动填写
+- **v2.3**
+  - 支持 `OAUTH_CLIENT_ID` 环境变量（32 位 hex 校验，未配置则保持内置默认）
+- **v2.2**
+  - OAuth scope 改用 `workers-scripts.admin`，修复 `invalid_scope` 报错
+- **v2.1**
+  - 修复重新部署时清空 secrets 的数据丢失 bug
+  - Pages 资源哈希改为原始字节，与 wrangler 口径一致
 
 ## 功能截图
 
@@ -139,6 +156,12 @@ OAuth 说明：标准 Authorization Code + PKCE（S256）流程；access token �
 
 凭据保存在浏览器 localStorage，每次请求发送给同源 Worker 后端，
 不直接发往前端的 `api.cloudflare.com`。
+
+## OAuth 客户端配置
+
+自建 OAuth 客户端（用于"使用 Cloudflare 账号登录"）：
+
+👉 **[OAuth 客户端配置图文教程](https://fangnb.github.io/cf-panel/oauth-setup-tutorial.html)**（从零创建 → 域名验证 → 设为公开 → 接入面板）
 
 ## 已知限制
 
